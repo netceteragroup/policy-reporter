@@ -1,0 +1,135 @@
+name: "NCA: package and publish Policy Reporter Helm chart"
+
+env:
+  CHART_REPO_PREFIX: "/policy-reporter-chart"
+  ECR_TEST_ACCOUNT: "182084413329"
+  ECR_PROD_ACCOUNT: "182084413329"
+
+on:
+  workflow_dispatch:
+  push:
+    branch:
+      # uncomment this (and update to the current major version) if you want an
+      # image built for each commit
+      #- tag-2.16.1-NCA
+      # nca/X naming is used in actions below, adjust accordingly if needed
+      - nca/feature/*
+    tag:
+      - nca/release/*
+
+# On each push to the aforementioned branches or tags with names matching the
+# pattern above, the following happens:
+#
+# - Depending on Git reference name (branch or tag name) we determine a release
+#   for a would-be artifact.
+#   - nca/release/<RESULTING NAME>
+#   - nca/feature/<RESULTING NAME>
+#   - tag-VERSION-NCA --> VERSION-nca-GIT_SHA_FIRST_8_CHARS, i.e. 2.16.1-nca-aabbccdd
+#
+# - Note that when pushing to nca/feature branch or creating a nca/release tag,
+#   the artifacts will have the same name (will overwrite the previous
+#   versions). However, when pushing to tag-VERSION-NCA branch, each resulting
+#   artifact will be unique.
+#
+# - We also determine if it is a release build or just a test build. This
+#   affects on where the resulting image will be pushed to.
+#
+# - Docker images (nginx and django) are built. They are tagged with release
+#   determined above and pushed to repositories stated in environment variables
+#   above. The same image is pushed to both repositories.
+
+jobs:
+  helm-chart:
+    name: package and publish Helm chart
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: write
+      pages: write
+      id-token: write
+    steps:
+      - name: set ECR to use, release mode
+        if: ${{ startsWith(github.ref_name, 'nca/release/') }}
+        run: |
+          echo "VERSION_SUFFIX=-t${GITHUB_REF_NAME#nca/release/}" >> $GITHUB_ENV
+          echo "ECR_ACCOUNT=${ECR_PROD_ACCOUNT}" >> $GITHUB_ENV
+
+      - name: set ECR to use, feature branch mode
+        if: ${{ startsWith(github.ref_name, 'nca/feature/') }}
+        run: |
+          echo "VERSION_SUFFIX=-feature+${GITHUB_REF_NAME#nca/feature/}" >> $GITHUB_ENV
+          echo "ECR_ACCOUNT=${ECR_TEST_ACCOUNT}" >> $GITHUB_ENV
+
+      - name: set ECR to use, release branch mode
+        if: ${{ startsWith(github.ref_name, 'tag-') }}
+        run: |
+          t=$(echo ${GITHUB_REF_NAME} | tr '[:upper:]' '[:lower:]')
+          t="${t#tag-}"
+          t="${t%-nca}"
+          echo "VERSION_SUFFIX=-t$(echo $t | tr '[:upper:]' '[:lower:]').git${GITHUB_SHA:0:8}" >> $GITHUB_ENV
+          echo "ECR_ACCOUNT=${ECR_PROD_ACCOUNT}" >> $GITHUB_ENV
+
+      - name: checkout
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          fetch-depth: 0
+
+      - name: install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.1
+
+      - name: add yq
+        uses: mikefarah/yq@b534aa9ee5d38001fba3cd8fe254a037e4847b37 # v4.45.4
+
+      - name: set Helm chart version
+        id: set-helm-chart-version
+        run: |
+          echo "CHART_VERSION=$(yq -e '.version' charts/policy-reporter/Chart.yaml)${{ env.VERSION_SUFFIX }}" >> $GITHUB_ENV
+
+      - name: package Helm chart
+        id: package-helm-chart
+        run: |
+          mkdir build
+          yq -i '.version="${{ env.CHART_VERSION }}"' charts/policy-reporter/Chart.yaml
+          helm package charts/policy-reporter/ --destination ./build
+
+      - name: Configure AWS prod credentials (nca/release mode)
+        if: ${{ startsWith(github.ref_name, 'nca/release/') }}
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          aws-region: eu-central-1
+          aws-access-key-id: ${{ secrets.ECR_PROD_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.ECR_PROD_SECRET_KEY }}
+
+      - name: Configure AWS test credentials (nca/feature mode)
+        if: ${{ startsWith(github.ref_name, 'nca/feature/') }}
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          aws-region: eu-central-1
+          aws-access-key-id: ${{ secrets.ECR_TEST_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.ECR_TEST_SECRET_KEY }}
+
+      - name: Configure AWS test credentials (tag- mode)
+        if: ${{ startsWith(github.ref_name, 'tag-') }}
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          aws-region: eu-central-1
+          aws-access-key-id: ${{ secrets.ECR_TEST_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.ECR_TEST_SECRET_KEY }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # 2.0.1
+        with:
+          registries: ${{ env.ECR_ACCOUNT }}
+
+      - name: get caller identity 1
+        run: |
+          aws sts get-caller-identity
+
+      - name: Push helm chart to AWS ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          helm push ./build/policy-reporter-*.tgz oci://${{ env.REGISTRY }}${{ env.CHART_REPO_PREFIX }}/
